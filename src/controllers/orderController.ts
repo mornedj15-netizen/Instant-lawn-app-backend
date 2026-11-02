@@ -1,13 +1,16 @@
 import { Request, Response } from "express";
 import { getFirestore } from "firebase-admin/firestore";
-import { ensureInventory } from './inventoryController';
-
-const MAX_ORDERS_PER_DAY = 1;
+import { ensureInventory } from "./inventoryController";
+import {
+  estimateJob,
+  DAY_CAPACITY_MIN,
+  DEFAULT_JOB_MINUTES,
+} from "../utils/scheduling";
 
 const LAWN_IDS: Record<string, string> = {
-  'Kikuyu': 'kikuyu',
-  'LM Berea': 'lm-berea',
-  'Golf Green': 'golf-green',
+  Kikuyu: "kikuyu",
+  "LM Berea": "lm-berea",
+  "Golf Green": "golf-green",
 };
 
 // Puts an order's area back into stock (used when an order is cancelled)
@@ -16,7 +19,7 @@ const restoreStock = async (order: any): Promise<void> => {
   if (!id) return;
 
   const db = getFirestore();
-  const ref = db.collection('inventory').doc(id);
+  const ref = db.collection("inventory").doc(id);
   await db.runTransaction(async (tx) => {
     const doc = await tx.get(ref);
     if (!doc.exists) return;
@@ -25,7 +28,7 @@ const restoreStock = async (order: any): Promise<void> => {
   });
 };
 
-const getFullDates = async (): Promise<string[]> => {
+const getFullDates = async (requiredMinutes: number): Promise<string[]> => {
   const db = getFirestore();
   const today = new Date().toISOString().split("T")[0];
   const snapshot = await db
@@ -33,15 +36,19 @@ const getFullDates = async (): Promise<string[]> => {
     .where("deliveryDate", ">=", today)
     .get();
 
-  const counts: Record<string, number> = {};
+  const used: Record<string, number> = {};
   snapshot.docs.forEach((doc) => {
     const order = doc.data();
     if (order.status !== "Cancelled") {
-      counts[order.deliveryDate] = (counts[order.deliveryDate] || 0) + 1;
+      used[order.deliveryDate] =
+        (used[order.deliveryDate] || 0) +
+        (order.totalMinutes ?? DEFAULT_JOB_MINUTES);
     }
   });
 
-  return Object.keys(counts).filter((d) => counts[d] >= MAX_ORDERS_PER_DAY);
+  return Object.keys(used).filter(
+    (date) => used[date] + requiredMinutes > DAY_CAPACITY_MIN,
+  );
 };
 
 export const getBookedDates = async (
@@ -49,14 +56,48 @@ export const getBookedDates = async (
   res: Response,
 ): Promise<void> => {
   try {
-    res.status(200).json(await getFullDates());
+    const minutes = Number(req.query.minutes) || 1;
+    res.status(200).json(await getFullDates(minutes));
   } catch (error: any) {
     console.error("getBookedDates error:", error.message);
     res.status(500).json({ message: error.message });
   }
 };
 
-export const createOrder = async (req: Request, res: Response): Promise<void> => {
+export const getEstimate = async (
+  req: Request,
+  res: Response,
+): Promise<void> => {
+  try {
+    const { latitude, longitude, area, serviceType } = req.body;
+    const areaNum = Number(area);
+
+    if (
+      typeof latitude !== "number" ||
+      typeof longitude !== "number" ||
+      !Number.isFinite(areaNum) ||
+      areaNum <= 0 ||
+      !["Delivery", "Installation"].includes(serviceType)
+    ) {
+      res
+        .status(400)
+        .json({ message: "Location, area and service type are required" });
+      return;
+    }
+
+    res
+      .status(200)
+      .json(await estimateJob(latitude, longitude, areaNum, serviceType));
+  } catch (error: any) {
+    console.error("getEstimate error:", error.message);
+    res.status(500).json({ message: error.message });
+  }
+};
+
+export const createOrder = async (
+  req: Request,
+  res: Response,
+): Promise<void> => {
   try {
     const {
       lawnType,
@@ -72,27 +113,54 @@ export const createOrder = async (req: Request, res: Response): Promise<void> =>
     const areaNum = Number(area);
     const inventoryId = LAWN_IDS[lawnType];
     if (!inventoryId || !Number.isFinite(areaNum) || areaNum <= 0) {
-      res.status(400).json({ message: 'Invalid lawn type or area' });
+      res.status(400).json({ message: "Invalid lawn type or area" });
       return;
     }
 
-    const today = new Date().toISOString().split('T')[0];
+    if (!["Delivery", "Installation"].includes(serviceType)) {
+      res.status(400).json({ message: "Invalid service type" });
+      return;
+    }
+
+    if (typeof latitude !== "number" || typeof longitude !== "number") {
+      res.status(400).json({ message: "Please select a location on the map" });
+      return;
+    }
+
+    const today = new Date().toISOString().split("T")[0];
     if (deliveryDate < today) {
-      res.status(400).json({ message: 'You cannot book a date in the past' });
+      res.status(400).json({ message: "You cannot book a date in the past" });
       return;
     }
 
-    const fullDates = await getFullDates();
+    const estimate = await estimateJob(
+      latitude,
+      longitude,
+      areaNum,
+      serviceType,
+    );
+
+    if (estimate.totalMinutes > DAY_CAPACITY_MIN) {
+      res.status(400).json({
+        message:
+          "This job is too large to complete in one day. Please contact SESMYL to arrange it.",
+      });
+      return;
+    }
+
+    const fullDates = await getFullDates(estimate.totalMinutes);
     if (fullDates.includes(deliveryDate)) {
-      res.status(400).json({ message: 'That date is fully booked' });
+      res.status(400).json({
+        message: "There is not enough time left on that date for this order",
+      });
       return;
     }
 
     await ensureInventory();
 
     const db = getFirestore();
-    const inventoryRef = db.collection('inventory').doc(inventoryId);
-    const orderRef = db.collection('orders').doc();
+    const inventoryRef = db.collection("inventory").doc(inventoryId);
+    const orderRef = db.collection("orders").doc();
 
     // Check stock, deduct it and save the order in one step
     const result = await db.runTransaction(async (tx) => {
@@ -111,10 +179,14 @@ export const createOrder = async (req: Request, res: Response): Promise<void> =>
         serviceType,
         deliveryDate,
         address,
-        latitude: latitude || null,
-        longitude: longitude || null,
-        status: 'Pending',
-        notes: notes || '',
+        latitude,
+        longitude,
+        distanceKm: estimate.distanceKm,
+        travelMinutes: estimate.travelMinutes,
+        workMinutes: estimate.workMinutes,
+        totalMinutes: estimate.totalMinutes,
+        status: "Pending",
+        notes: notes || "",
         createdAt: new Date().toISOString(),
       });
       return { error: null };
@@ -128,7 +200,7 @@ export const createOrder = async (req: Request, res: Response): Promise<void> =>
     const order = await orderRef.get();
     res.status(201).json({ id: order.id, ...order.data() });
   } catch (error: any) {
-    console.error('createOrder error:', error.message);
+    console.error("createOrder error:", error.message);
     res.status(500).json({ message: error.message });
   }
 };
@@ -191,31 +263,46 @@ export const getAllOrders = async (
   }
 };
 
-export const updateOrderStatus = async (req: Request, res: Response): Promise<void> => {
+export const updateOrderStatus = async (
+  req: Request,
+  res: Response,
+): Promise<void> => {
   try {
-    const { status } = req.body;
-    if (!['Pending', 'Processing', 'Delivered', 'Cancelled'].includes(status)) {
-      res.status(400).json({ message: 'Invalid status' });
+    const { status, restock } = req.body;
+    if (!["Pending", "Processing", "Delivered", "Cancelled"].includes(status)) {
+      res.status(400).json({ message: "Invalid status" });
       return;
     }
 
     const db = getFirestore();
-    const ref = db.collection('orders').doc(req.params.id);
+    const ref = db.collection("orders").doc(req.params.id);
     const existing = await ref.get();
 
     if (!existing.exists) {
-      res.status(404).json({ message: 'Order not found' });
+      res.status(404).json({ message: "Order not found" });
       return;
     }
 
     const order = existing.data() as any;
-    if (order.status === 'Cancelled') {
-      res.status(400).json({ message: 'This order is already cancelled' });
+
+    if (order.status === "Cancelled") {
+      res.status(400).json({ message: "This order is already cancelled" });
       return;
     }
 
-    if (status === 'Cancelled') {
-      await restoreStock(order);
+    if (order.status === "Delivered" && status === "Cancelled") {
+      res
+        .status(400)
+        .json({ message: "A delivered order cannot be cancelled" });
+      return;
+    }
+
+    // Pending orders are always restocked. For Processing orders the admin
+    // chooses whether the turf can go back into stock.
+    if (status === "Cancelled") {
+      if (order.status === "Pending" || restock === true) {
+        await restoreStock(order);
+      }
     }
 
     await ref.update({ status });
@@ -226,30 +313,33 @@ export const updateOrderStatus = async (req: Request, res: Response): Promise<vo
   }
 };
 
-export const cancelOrder = async (req: Request, res: Response): Promise<void> => {
+export const cancelOrder = async (
+  req: Request,
+  res: Response,
+): Promise<void> => {
   try {
     const db = getFirestore();
-    const ref = db.collection('orders').doc(req.params.id);
+    const ref = db.collection("orders").doc(req.params.id);
     const orderDoc = await ref.get();
 
     if (!orderDoc.exists) {
-      res.status(404).json({ message: 'Order not found' });
+      res.status(404).json({ message: "Order not found" });
       return;
     }
 
     const order = orderDoc.data() as any;
     if (order.customer !== (req as any).user.uid) {
-      res.status(401).json({ message: 'Not authorized' });
+      res.status(401).json({ message: "Not authorized" });
       return;
     }
 
-    if (order.status === 'Cancelled') {
-      res.status(400).json({ message: 'This order is already cancelled' });
+    if (order.status !== "Pending") {
+      res.status(400).json({ message: "Only pending orders can be cancelled" });
       return;
     }
 
     await restoreStock(order);
-    await ref.update({ status: 'Cancelled' });
+    await ref.update({ status: "Cancelled" });
 
     const updated = await ref.get();
     res.status(200).json({ id: updated.id, ...updated.data() });

@@ -95,3 +95,28 @@ export const getProfile = async (req: Request, res: Response): Promise<void> => 
     res.status(500).json({ message: error.message });
   }
 };
+
+export const forgotPassword = async (req: Request, res: Response): Promise<void> => {
+  const { email } = req.body;
+
+  if (!email) {
+    res.status(400).json({ message: 'Email is required' });
+    return;
+  }
+
+  try {
+    await axios.post(
+      `https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key=${process.env.FIREBASE_API_KEY}`,
+      { requestType: 'PASSWORD_RESET', email }
+    );
+  } catch (error: any) {
+    // Logged for us, but never shown to the user (see below)
+    console.error('forgotPassword error:', error.response?.data?.error?.message || error.message);
+  }
+
+  // Same answer whether or not the email exists, so nobody can use this
+  // endpoint to find out which emails have accounts
+  res.status(200).json({
+    message: 'If an account exists for that email, a reset link has been sent.',
+  });
+};

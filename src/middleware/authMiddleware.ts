@@ -7,6 +7,7 @@ export const protect = async (
   res: Response,
   next: NextFunction
 ): Promise<void> => {
+  console.log('protect hit:', req.method, req.originalUrl, 'auth header:', req.headers.authorization?.slice(0, 20));
   try {
     let token;
 
@@ -35,8 +36,9 @@ export const protect = async (
     (req as any).user = { uid: decoded.uid, ...userDoc.data() };
     next();
   } catch (error: any) {
-    res.status(401).json({ message: 'Not authorized, token failed' });
-  }
+  console.error('protect failed:', error.name, '-', error.message);
+  res.status(401).json({ message: 'Not authorized, token failed' });
+}
 };
 
 export const adminOnly = (
